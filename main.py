@@ -10,13 +10,13 @@ from collections import defaultdict
 APP_ID = "cli_a9a427abc73a1bc7"
 APP_SECRET = "xza3K8d65ks5DcN9DG1P7dTAXKNYLz5E"
 
-# 之前更新的表格 Token
+# 表格 Token
 SPREADSHEET_TOKEN = "Y7sEsZsjrhcQyvt0U7HcyqGPnNh"
 
-# ✅ 变更点：已更新为新的企业微信 Webhook
+# 企业微信 Webhook
 WECOM_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=9f59729a-0140-4044-88a2-026996d894bb"
 
-# 之前更新的子表 ID
+# 子表 ID
 TARGET_SHEET_IDS = ["Z7k4T5"]
 
 class MonitorBot:
@@ -26,7 +26,6 @@ class MonitorBot:
         self.scanned_list = []
         self.error_count = 0    
 
-    # ⚠️ 注意：读取飞书表格数据仍需保留此认证函数
     def get_tenant_access_token(self):
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         try:
@@ -73,17 +72,17 @@ class MonitorBot:
     def is_safe_content(self, text):
         safe_words = [
             "通过", "完成", "无需", "pass", "ok", "done", 
-            "提交下游", "已提交下游", "交下游"
+            "提交下游", "已提交下游", "交下游", "-", "/"
         ]
         text_lower = text.lower()
+        # 如果是单个 - 或 / 视为无需填写，不算空白
+        if text.strip() in ["-", "/"]: return True
         return any(w in text_lower for w in safe_words)
 
     def is_noise(self, text):
         t = text.strip().lower()
-        if not t: return True
-        if t in ["-", "/", "\\", "."]: return True
-        if re.match(r'^[cC]\d+$', t): return True
-        if re.search(r'\d+\s*[xX*]\s*\d+', t): return True
+        if not t: return True # 空文本由主逻辑处理，此处仅过滤纯符号噪音
+        if t in ["\\", "."]: return True
         return False
 
     def has_chinese(self, text):
@@ -113,27 +112,38 @@ class MonitorBot:
             return h1
         return "未知环节"
 
+    # ✅ 核心修改：同时检测日期和空白
     def scan_row_full(self, row, now, header1, header2):
         total_cols = len(row)
         issues = []
         
         for i in range(total_cols):
-            text = self.clean_text(row[i]).strip()
-            if not text: continue
-            if self.is_noise(text): continue
-            if self.is_safe_content(text): continue
-            if not self.has_chinese(text): continue 
-
-            match = re.search(r'(0[1-9]|1[0-2]|[1-9])[\.\-\/]?([0-2][0-9]|3[01]|[1-9])', text)
+            raw_text = self.clean_text(row[i])
+            text = raw_text.strip()
             
-            if match:
-                h1 = self.clean_text(header1[i] if i < len(header1) else "").strip()
-                h2 = self.clean_text(header2[i] if i < len(header2) else "").strip()
-                full_header = h1 + h2
-                
-                if ("状态" not in full_header and "进度" not in full_header): continue 
-                if "反馈" in full_header: continue 
+            # 1. 先判断表头，确定这是否是“状态/进度”列
+            h1 = self.clean_text(header1[i] if i < len(header1) else "").strip()
+            h2 = self.clean_text(header2[i] if i < len(header2) else "").strip()
+            full_header = h1 + h2
+            
+            # 必须包含状态或进度，且不是反馈列
+            if ("状态" not in full_header and "进度" not in full_header): continue
+            if "反馈" in full_header: continue
 
+            stage_name = self.find_stage_name_dynamic(i, header1, header2)
+
+            # 2. 检查空白 (新增逻辑)
+            if not text:
+                # 如果是空白，标记为 missing
+                issues.append(("[空]", i, stage_name, 'missing', 0))
+                continue
+            
+            # 3. 如果不是空白，检查是否是安全词（完成/Pass等）
+            if self.is_safe_content(text): continue
+            
+            # 4. 检查日期 (旧逻辑)
+            match = re.search(r'(0[1-9]|1[0-2]|[1-9])[\.\-\/]?([0-2][0-9]|3[01]|[1-9])', text)
+            if match:
                 try:
                     m_str, d_str = match.group(1), match.group(2)
                     month, day = int(m_str), int(d_str)
@@ -149,13 +159,12 @@ class MonitorBot:
                     is_today = (days_diff == 0)
                     is_yesterday = (days_diff == 1)
                     
-                    stage_name = self.find_stage_name_dynamic(i, header1, header2)
-
                     if is_today or is_yesterday:
                         issues.append((text, i, stage_name, 'recent', days_diff)) 
                     elif days_diff > 1:
                         issues.append((text, i, stage_name, 'severe', days_diff)) 
                 except ValueError: continue
+                
         return issues
 
     def process_single_sheet(self, current_sheet_id):
@@ -180,6 +189,7 @@ class MonitorBot:
         
         recent_groups = defaultdict(list)
         backlog_groups = defaultdict(list)
+        missing_groups = defaultdict(list) # ✅ 新增：空白项分组
 
         data_rows = rows[2:] if len(rows) > 2 else []
 
@@ -204,32 +214,49 @@ class MonitorBot:
                     col_char = self.get_column_letter(col_idx)
                     coord_info = f" ({col_char}{real_row_num})"
                 
-                display_text = f"**[{stage_name}] {display_name}**: {status_text}{coord_info}"
-                
-                if issue_type == 'recent':
+                # ✅ 不同的 issue_type 使用不同的格式
+                if issue_type == 'missing':
                     self.error_count += 1
+                    display_text = f"**[{stage_name}] {display_name}**: 未填写{coord_info}"
+                    missing_groups[stage_name].append(f"⚪️ {display_text}")
+
+                elif issue_type == 'recent':
+                    self.error_count += 1
+                    display_text = f"**[{stage_name}] {display_name}**: {status_text}{coord_info}"
                     recent_groups[stage_name].append(f"🟠 {display_text} (近期变动)")
+
                 elif issue_type == 'severe':
                     self.error_count += 1
+                    display_text = f"**[{stage_name}] {display_name}**: {status_text}{coord_info}"
                     backlog_groups[stage_name].append(f"🔴 {display_text} (超期{days}天)")
 
         # 组装消息列表 (含空行)
         final_msg_list = []
         
+        # 1. 优先处理
         if recent_groups:
-            final_msg_list.append("⚡ **今日/昨日最新变动 (请优先处理)：**")
+            final_msg_list.append("⚡ **今日/昨日最新变动：**")
             for stage, items in recent_groups.items():
                 final_msg_list.extend(items)
                 final_msg_list.append("") 
             final_msg_list.append("----------------------------------") 
         
+        # 2. 状态缺失 (新增板块)
+        if missing_groups:
+            final_msg_list.append("⚠️ **状态缺失 (未填写)：**")
+            for stage, items in missing_groups.items():
+                final_msg_list.extend(items)
+                final_msg_list.append("")
+            final_msg_list.append("----------------------------------")
+
+        # 3. 历史积压
         if backlog_groups:
             final_msg_list.append("📉 **历史积压与异常风险：**")
             for stage, items in backlog_groups.items():
                 final_msg_list.extend(items)
                 final_msg_list.append("") 
 
-        # ✅ 变更点：仅发送企微通道
+        # 发送企微通道
         self.send_wecom_alert(sheet_name, final_msg_list, current_sheet_id)
 
     # 🚀 企微发送函数
@@ -240,16 +267,14 @@ class MonitorBot:
 
         print(f"🚀 发送企微: {sheet_name}")
         
-        # 企微消息分片 (防止超长)
-        CHUNK_SIZE = 20 # 每次发20行左右
+        # 企微消息分片
+        CHUNK_SIZE = 20
         for i in range(0, len(msgs), CHUNK_SIZE):
             chunk = msgs[i : i + CHUNK_SIZE]
             content_str = "\n".join(chunk)
             
-            # 第一条带标题
             title = f"## 🚨 进度异常日报 | {sheet_name}\n" if i == 0 else ""
             
-            # 最后一条带链接
             footer = ""
             if (i + CHUNK_SIZE) >= len(msgs):
                 sheet_url = f"https://feishu.cn/sheets/{SPREADSHEET_TOKEN}?sheet={sheet_id}"
@@ -268,7 +293,6 @@ class MonitorBot:
 
     def send_summary(self):
         print("发送汇总...")
-        # ✅ 变更点：仅发送企微汇总
         wc_content = f"## ✅ 巡检完成日报\n**共扫描 {len(self.scanned_list)} 个表格**\n🚫 **发现风险项：** <font color=\"warning\">{self.error_count}</font> 个"
         try: 
             time.sleep(0.5)
@@ -276,7 +300,7 @@ class MonitorBot:
         except: pass
 
     def run(self):
-        print("🤖 V49.2 (Single Channel: WeCom Only)...")
+        print("🤖 V49.3 (Status Missing Detection)...")
         self.load_all_sheet_names()
         for sheet_id in TARGET_SHEET_IDS:
             try:
