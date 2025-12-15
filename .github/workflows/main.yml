@@ -1,0 +1,33 @@
+name: Daily Monitor Bot
+
+on:
+  # 1. 允许手动点击按钮运行 (用于测试)
+  workflow_dispatch:
+  # 2. 定时运行 (UTC时间)
+  # 北京时间 09:30 = UTC 01:30
+  schedule:
+    - cron: '30 1 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # 第一步：拉取你的代码
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    # 第二步：安装 Python 环境
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    # 第三步：安装依赖库 (requests)
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    # 第四步：运行脚本
+    - name: Run Monitor Script
+      run: python main.py
