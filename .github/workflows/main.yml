@@ -4,9 +4,11 @@ on:
   # 1. 允许手动点击按钮运行 (用于测试)
   workflow_dispatch:
   # 2. 定时运行 (UTC时间)
-  # 北京时间 09:30 = UTC 01:30
+  # 北京时间 10:30 = UTC 02:30
+  # 北京时间 17:00 = UTC 09:00
   schedule:
-    - cron: '30 1 * * *'
+    - cron: '30 2 * * *'
+    - cron: '0 9 * * *'
 
 jobs:
   run-bot:
